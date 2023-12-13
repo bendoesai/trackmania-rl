@@ -483,6 +483,8 @@ class MyActorModule(TorchActorModule):
             The loaded ActorModule instance
         """
         self.device = device
+        print(path)
+        print("YEET")
         with open(path, 'r') as json_file:
             state_dict = json.load(json_file, cls=TorchJSONDecoder)
         self.load_state_dict(state_dict)

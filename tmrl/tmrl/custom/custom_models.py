@@ -478,6 +478,7 @@ class EffNetActorCritic(nn.Module):
 
 
 def num_flat_features(x):
+    print("x size:" + str(x.size))
     size = x.size()[1:]
     num_features = 1
     for s in size:
@@ -517,7 +518,8 @@ class VanillaCNN(Module):
             speed, gear, rpm, images, act1, act2, act = x
         else:
             speed, gear, rpm, images, act1, act2 = x
-
+        print("goober")
+        images = torch.from_numpy(images[3])
         x = F.relu(self.conv1(images))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
