@@ -1,6 +1,4 @@
-# AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-
-![image](spong.jpg)
+# Trackmania-RL (revived final project from undergrad)
 
 https://github.com/trackmania-rl/tmrl
 
