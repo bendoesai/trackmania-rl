@@ -9,13 +9,25 @@ import torch.nn.functional as F
 from torch.distributions import Normal
 
 from utils import ReplayBuffer
+import networks
 
 
 
 DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger()
+
+def build_model(model, obs_space, hidden, act_space) -> nn.Module:
+    model_map = {
+        'basicnet': networks.basicnet,
+    }
+
+    if model.lower() not in model_map:
+        raise ValueError(f'Model {model} not recognized. Choose from {list(model_map.keys())}')
+    
+    return model_map[model.lower()](obs_space, hidden, act_space)
+
 
 class DummyAgent(nn.Module):
     def __init__(self, config, obs_space, act_space):
@@ -43,13 +55,7 @@ class VPGAgent(nn.Module):
         self.actions = []
         
         # Hook for external policy network
-        self.policy = nn.Sequential(
-            nn.Linear(obs_space, 256),
-            nn.LeakyReLU(),
-            nn.Linear(256, 256),
-            nn.LeakyReLU(),
-            nn.Linear(256, act_space)
-        )
+        self.policy = build_model(config['actor_model'], obs_space, config['hidden'], act_space * 2)
     
     def forward(self, obs):
         if isinstance(obs, np.ndarray):
@@ -63,17 +69,18 @@ class VPGAgent(nn.Module):
         log_stds = action_params[..., action_dim:]
         
         # Clamp log_stds for stability
-        log_stds = torch.clamp(log_stds, -20, 2)
         stds = log_stds.exp()
         
         return means, stds
     
     def act(self, obs, eval = False):
         means, stds = self.forward(obs)
+        if not eval:
+            stds = torch.clamp(stds, min=0.1, max=8)
         dist = Normal(means, stds)
         raw_action = dist.rsample()  # Use reparameterization trick
         action = torch.tanh(raw_action)  # Squash action to (-1,1)
-        
+
         log_prob = dist.log_prob(raw_action).sum(-1)
         log_prob -= torch.log(1 - action.pow(2) + 1e-6).sum(-1)  # Apply tanh correction
 
@@ -92,7 +99,7 @@ class VPGAgent(nn.Module):
         policy_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
         for param in self.policy.parameters():
-            print(param.grad.norm().item() if param.grad is not None else "No grad")
+            logger.debug(param.grad.norm().item() if param.grad is not None else "No grad")
         self.optimizer.step()
         
         self.saved_log_probs = []

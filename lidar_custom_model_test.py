@@ -30,11 +30,14 @@ def parse_args():
     parser.add_argument('--agent', type=str, default='dummy', 
                         choices=['dummy', 'vpg', 'trpo', 'ppo', 'ddpg', 'td3', 'sac'],
                         help='Agent type to use')
+    parser.add_argument('--actor_model', type=str, default='basicnet', 
+                        choices=['basicnet'],
+                        help='Agent type to use')
     parser.add_argument('--checkpoint_path', type=str, default=None,
                         help='Path to load/save checkpoints')
     parser.add_argument('--eval_freq', type=int, default=10,
                         help='Evaluate every N episodes')
-    parser.add_argument('--seed', type=int, default=1024,
+    parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
     parser.add_argument('--max_episodes', type=int, default=10000,
                         help='Maximum number of episodes')
@@ -111,9 +114,10 @@ def build_agent(agent_name: str, config: dict, obs_space_flat: int, num_actions:
     
     return agent_map[agent_name.lower()](config, obs_space_flat, num_actions)
 
-def flatten_observation(obs):
+def flatten_and_norm_observation(obs):
     """Flattens a tuple of tuples with varying lengths into a single tuple."""
     flat = np.concatenate([np.ravel(arr) for arr in obs])
+    flat = (flat - flat.mean()) / (flat.std() + 1e-8)
     return flat
 
 def evaluate(agent, env, num_episodes=5):
@@ -122,7 +126,7 @@ def evaluate(agent, env, num_episodes=5):
     
     for _ in range(num_episodes):
         obs, _ = env.reset()
-        obs = flatten_observation(obs)
+        obs = flatten_and_norm_observation(obs)
         episode_reward = 0
         done = False
         
@@ -130,7 +134,7 @@ def evaluate(agent, env, num_episodes=5):
             with torch.no_grad():
                 action = agent.act(obs, eval=True)
             obs, reward, terminated, truncated, _ = env.step(np.array(action))
-            obs = flatten_observation(obs)
+            obs = flatten_and_norm_observation(obs)
             episode_reward += reward
             done = terminated or truncated
             
@@ -141,7 +145,7 @@ def evaluate(agent, env, num_episodes=5):
 
 def main():
     # Setup logging
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.DEBUG)
     logger = logging.getLogger(__name__)
     
     # Parse and validate config
@@ -152,7 +156,7 @@ def main():
     env = get_environment()
     
     obs_space_flat = sum(np.prod(box.shape) for box in env.observation_space)
-    num_actions = env.action_space.shape[0] * 2
+    num_actions = env.action_space.shape[0]
     
     logger.info(f"Observation space: {obs_space_flat}")
     logger.info(f"Action space: {num_actions}")
@@ -190,7 +194,7 @@ def main():
         for episode in range(start_episode, config['max_episodes']):
             agent.train()
             obs, _ = env.reset()
-            obs = flatten_observation(obs)
+            obs = flatten_and_norm_observation(obs)
             episode_rewards = []
             
             # Episode loop
@@ -204,11 +208,12 @@ def main():
                 agent.rewards.append(reward)
                 episode_rewards.append(reward)
                 
-                obs = flatten_observation(next_obs)
+                obs = flatten_and_norm_observation(next_obs)
                 if terminated or truncated:
                     break
             
             total_reward = sum(episode_rewards)
+            print(total_reward)
             reward_history.append(total_reward)
             
             # Batch update
@@ -220,7 +225,7 @@ def main():
                 logger.info(f"Episode {episode}, Loss: {loss:.3f}, Reward: {total_reward:.3f}")
             
             # Evaluation
-            if episode % config['eval_freq'] == 0:
+            if episode > 0 and episode % config['eval_freq'] == 0:
                 mean_reward, std_reward = evaluate(agent, env)
                 logger.info(f"Evaluation: Mean reward: {mean_reward:.3f} +/- {std_reward:.3f}")
                 
