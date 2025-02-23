@@ -1,182 +1,261 @@
 from tmrl import get_environment
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
 import torch
-import torch.nn as nn
-import torch.functional as F
 import torch.optim as optim
-
+import agents
 from time import sleep
-from abc import ABC, abstractmethod
+import argparse
+from pathlib import Path
+import logging
+from typing import Dict, Type, Set
 
+def get_agent_required_args() -> Dict[str, Set[str]]:
+    """Define required arguments for each agent type"""
+    return {
+        'dummy': set(),  # Dummy agent needs no config
+        'vpg': {'hidden', 'batch_size', 'lr', 'gamma'},
+        'trpo': {'hidden', 'batch_size', 'lr', 'gamma', 'max_kl'},
+        'ppo': {'hidden', 'batch_size', 'lr', 'gamma', 'clip_ratio', 'vf_coef'},
+        'ddpg': {'hidden', 'batch_size', 'lr', 'gamma', 'tau', 'buffer_size'},
+        'td3': {'hidden', 'batch_size', 'lr', 'gamma', 'tau', 'buffer_size', 'policy_delay'},
+        'sac': {'hidden', 'batch_size', 'lr', 'gamma', 'alpha', 'buffer_size'}
+    }
 
-class RandomAgent(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.name = 'RandomAgent'
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train RL agents on LIDAR environment')
     
-    def act(self, obs):
-        """
-        simplistic policy for LIDAR observations
-        """
-        deviation = obs[1].mean(0)
-        deviation /= (deviation.sum() + 0.001)
-        steer = 0
-        for i in range(19):
-            steer += (i - 9) * deviation[i]
-        steer = - np.tanh(steer * 4)
-        steer = min(max(steer, -1.0), 1.0)
-        return np.array([1.0, 0.0, steer])
+    # Basic arguments
+    parser.add_argument('--agent', type=str, default='dummy', 
+                        choices=['dummy', 'vpg', 'trpo', 'ppo', 'ddpg', 'td3', 'sac'],
+                        help='Agent type to use')
+    parser.add_argument('--checkpoint_path', type=str, default=None,
+                        help='Path to load/save checkpoints')
+    parser.add_argument('--eval_freq', type=int, default=10,
+                        help='Evaluate every N episodes')
+    parser.add_argument('--seed', type=int, default=1024,
+                        help='Random seed')
+    parser.add_argument('--max_episodes', type=int, default=10000,
+                        help='Maximum number of episodes')
+    parser.add_argument('--max_timesteps', type=int, default=100000,
+                        help='Maximum timesteps per episode')
     
-class CarCrasher9000(nn.Module):
-    # A2C implementation
-    def __init__(self,
-                 obs_space,
-                 action_space,
-                 hidden_size,):
+    # Common agent arguments
+    parser.add_argument('--hidden', type=int, default=64,
+                        help='Hidden layer size')
+    parser.add_argument('--batch_size', type=int, default=10,
+                        help='Batch size for updates')
+    parser.add_argument('--lr', type=float, default=5e-4,
+                        help='Learning rate')
+    parser.add_argument('--gamma', type=float, default=0.99,
+                        help='Discount factor')
+    
+    # Agent-specific arguments
+    parser.add_argument('--max_kl', type=float, default=0.01,
+                        help='TRPO max KL divergence')
+    parser.add_argument('--clip_ratio', type=float, default=0.2,
+                        help='PPO clip ratio')
+    parser.add_argument('--vf_coef', type=float, default=0.5,
+                        help='PPO value function coefficient')
+    parser.add_argument('--tau', type=float, default=0.005,
+                        help='DDPG/TD3 soft update coefficient')
+    parser.add_argument('--buffer_size', type=int, default=100000,
+                        help='DDPG/TD3/SAC replay buffer size')
+    parser.add_argument('--policy_delay', type=int, default=2,
+                        help='TD3 policy update delay')
+    parser.add_argument('--alpha', type=float, default=0.2,
+                        help='SAC entropy coefficient')
+    
+    args = parser.parse_args()
+    
+    # Convert args to dict for easier handling
+    config = vars(args)
+    return config
+
+def validate_agent_config(agent_type: str, config: dict) -> None:
+    """Validate config based on agent type"""
+    required_args = get_agent_required_args()[agent_type]
+    missing = [arg for arg in required_args if arg not in config or config[arg] is None]
+    if missing:
+        raise ValueError(f"Agent {agent_type} requires the following arguments: {missing}")
+    
+    # Agent-specific validation
+    if agent_type == 'vpg':
+        if config['batch_size'] < 1:
+            raise ValueError("batch_size must be positive")
+        if config['lr'] <= 0:
+            raise ValueError("lr must be positive")
+        if not 0 <= config['gamma'] <= 1:
+            raise ValueError("gamma must be between 0 and 1")
+    
+    elif agent_type == 'ppo':
+        if config['clip_ratio'] <= 0:
+            raise ValueError("clip_ratio must be positive")
+        if config['vf_coef'] < 0:
+            raise ValueError("vf_coef must be non-negative")
+
+def build_agent(agent_name: str, config: dict, obs_space_flat: int, num_actions: tuple):
+    agent_map = {
+        'dummy': agents.DummyAgent,
+        'vpg': agents.VPGAgent,
+        'trpo': agents.TRPOAgent,
+        'ppo': agents.PPOAgent,
+        'ddpg': agents.DDPGAgent,
+        'td3': agents.TD3Agent,
+        'sac': agents.SACAgent
+    }
+
+    if agent_name.lower() not in agent_map:
+        raise ValueError(f'Agent {agent_name} not recognized. Choose from {list(agent_map.keys())}')
+    
+    return agent_map[agent_name.lower()](config, obs_space_flat, num_actions)
+
+def flatten_observation(obs):
+    """Flattens a tuple of tuples with varying lengths into a single tuple."""
+    flat = np.concatenate([np.ravel(arr) for arr in obs])
+    return flat
+
+def evaluate(agent, env, num_episodes=5):
+    agent.eval()
+    eval_rewards = []
+    
+    for _ in range(num_episodes):
+        obs, _ = env.reset()
+        obs = flatten_observation(obs)
+        episode_reward = 0
+        done = False
         
-        super(CarCrasher9000, self).__init__()
+        while not done:
+            with torch.no_grad():
+                action = agent.act(obs, eval=True)
+            obs, reward, terminated, truncated, _ = env.step(np.array(action))
+            obs = flatten_observation(obs)
+            episode_reward += reward
+            done = terminated or truncated
+            
+        eval_rewards.append(episode_reward)
+    
+    agent.train()
+    return np.mean(eval_rewards), np.std(eval_rewards)
 
-        self.name = "CarCrasher9000"
-        self.action_space = action_space
-        self.obs_space = obs_space
-
-        torch.set_default_tensor_type(torch.FloatTensor)
-
-        self.critic = nn.Sequential(
-            nn.Linear(self.obs_space, hidden_size),
-            nn.LeakyReLU(),
-            nn.Linear(hidden_size, int(hidden_size/2)),
-            nn.LeakyReLU(),
-            nn.Linear(int(hidden_size/2), 1)
-        )
-
-        self.actor_base = nn.Sequential(
-            nn.Linear(self.obs_space, hidden_size),
-            nn.LeakyReLU(),
-            nn.Linear(hidden_size, int(hidden_size/2)),
-            nn.LeakyReLU(),
-        )
-
-        self.actor_mu = nn.Sequential(
-            nn.Linear(int(hidden_size/2), self.action_space),
-            nn.Tanh() #compress outputs between 1 and -1
-        )
-
-        self.actor_var = nn.Sequential(
-            nn.Linear(int(hidden_size/2), self.action_space),
-            nn.Softplus()
-        )
-
-    def forward(self, obs):
-        
-        obs = obs.float()
-
-        value = self.critic(obs)
-
-        action_base = self.actor_base(obs)
-        action_mu = self.actor_mu(action_base)
-        action_var = self.actor_var(action_base)
-
-
-        return value, torch.stack((action_mu, action_var), dim=1)
-
-    def act(self, obs):
-        #value of the action, mean and standard deviation of
-        #each action slot (means, variances)
-        value, dists = self.forward(obs)
-
-        #output should be (3,)
-        action = [np.random.normal(float(dist[0]), float(dist[1])) for dist in dists]
-        for i, a in enumerate(action):
-            if a > 1:
-                action[i]=0.999
-            elif a < -1:
-                action[i]=-0.999
-        return action, value
-
-def obs_to_tensor(obs):
-    return torch.tensor(np.hstack([obs[0], np.hstack(obs[1]), np.squeeze(obs[2]), np.squeeze(obs[3])]), dtype=torch.float32)
-
-if __name__ == "__main__":
-    # Let us retrieve the TMRL Gym environment.
-    # The environment you get from get_environment() depends on the content of config.json
+def main():
+    # Setup logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    # Parse and validate config
+    config = parse_args()
+    validate_agent_config(config['agent'], config)
+    
+    # Setup environment
+    env = get_environment()
+    
+    obs_space_flat = sum(np.prod(box.shape) for box in env.observation_space)
+    num_actions = env.action_space.shape[0] * 2
+    
+    logger.info(f"Observation space: {obs_space_flat}")
+    logger.info(f"Action space: {num_actions}")
+    logger.info(f"Training {config['agent']} agent with config:")
+    for k, v in config.items():
+        logger.info(f"  {k}: {v}")
+    
+    # Set random seeds
+    torch.manual_seed(config['seed'])
+    np.random.seed(config['seed'])
+    
+    # Initialize agent and optimizer
+    agent = build_agent(config['agent'], config, obs_space_flat, num_actions)
+    agent.optimizer = optim.Adam(
+        agent.parameters(),
+        lr=config['lr']
+    )
+    
+    if config['checkpoint_path'] and Path(config['checkpoint_path']).exists():
+        checkpoint = torch.load(config['checkpoint_path'])
+        agent.load_state_dict(checkpoint['model'])
+        agent.optimizer.load_state_dict(checkpoint['optimizer'])
+        start_episode = checkpoint['episode']
+        logger.info(f"Loaded checkpoint from episode {start_episode}")
+    else:
+        start_episode = 0
+    
+    # Training loop
+    reward_history = []
+    best_eval_reward = float('-inf')
     
     try:
-        MAX_TIMESTEPS = 50000
-        MAX_EPISODES = 10000
-
-        hyperparameters = {
-            'lr' : 5e-4,
-            'gamma': 0.99,
-        }
+        sleep(1.0)  # Allow time to focus TM20 window
         
-        env = get_environment()
+        for episode in range(start_episode, config['max_episodes']):
+            agent.train()
+            obs, _ = env.reset()
+            obs = flatten_observation(obs)
+            episode_rewards = []
+            
+            # Episode loop
+            for step in range(config['max_timesteps']):
 
-        agent = CarCrasher9000(
-            obs_space = 83,
-            action_space = 3,
-            hidden_size = 512,
-        )
+                action = agent.act(obs)
 
-        opt = torch.optim.Adam(
-            agent.parameters()
-        )
-
-        #agent = RandomAgent()
-
-        reward_tracker = []
-        time_tracker = []
-        high_score = 0
-
-        sleep(1.0)  # just so we have time to focus the TM20 window after starting the script
-        for episode in range(MAX_EPISODES):
-            rewards = []
-            values = []
-            # default LIDAR observations are of shape: ((1,), (4, 19), (3,), (3,))
-            # representing: (speed, 4 last LIDARs, 2 previous actions)
-            # actions are [gas, break, steer], analog between -1.0 and +1.0
-            obs, _ = env.reset()  # reset environment
-            for step in range(MAX_TIMESTEPS):  # rtgym ensures this runs at 20Hz by default
-                # compute action
-                action, value = agent.act(obs_to_tensor(obs))
-                values.append(value.detach().numpy())
-
-                # apply action (rtgym ensures healthy time-steps)
                 next_obs, reward, terminated, truncated, info = env.step(np.array(action))
                 
-                rewards.append(reward)
-
-                obs = next_obs
+                # Store transition
+                agent.rewards.append(reward)
+                episode_rewards.append(reward)
                 
+                obs = flatten_observation(next_obs)
                 if terminated or truncated:
-                    action, q_val = agent.act(obs_to_tensor(obs))
-                    q_val = q_val.detach().numpy()
-                    reward_tracker.append(np.sum(rewards))
-                    if np.sum(rewards) > high_score:
-                        torch.save(agent.state_dict(), 'checkpoints/LIDAR_{}'.format(np.sum(rewards)))
-                        high_score=np.sum(rewards)+1
-                    time_tracker.append(step)
-                    print("episode: {}, reward: {}, total length: {} \n".format(episode, np.sum(rewards), step))
                     break
+            
+            total_reward = sum(episode_rewards)
+            reward_history.append(total_reward)
+            
+            # Batch update
+            if episode > 0 and episode % config['batch_size'] == 0:
+                #print("Before update:", [p.norm().item() for p in agent.policy.parameters()])
+                loss = agent.update()
+                #print("After update:", [p.norm().item() for p in agent.policy.parameters()])
 
-            opt.step()
-            env.unwrapped.wait()  # rtgym-specific method to artificially 'pause' the environment when needed
-    
+                logger.info(f"Episode {episode}, Loss: {loss:.3f}, Reward: {total_reward:.3f}")
+            
+            # Evaluation
+            if episode % config['eval_freq'] == 0:
+                mean_reward, std_reward = evaluate(agent, env)
+                logger.info(f"Evaluation: Mean reward: {mean_reward:.3f} +/- {std_reward:.3f}")
+                
+                # Save best model
+                if mean_reward > best_eval_reward and config['checkpoint_path']:
+                    best_eval_reward = mean_reward
+                    checkpoint = {
+                        'model': agent.state_dict(),
+                        'optimizer': agent.optimizer.state_dict(),
+                        'episode': episode,
+                        'reward': mean_reward
+                    }
+                    torch.save(checkpoint, config['checkpoint_path'])
+                    logger.info(f"Saved new best model with reward {mean_reward:.3f}")
+            
+            env.unwrapped.wait()
+            
     except KeyboardInterrupt:
-        smoothed_rewards = pd.Series.rolling(pd.Series(reward_tracker), 10).mean()
-        smoothed_rewards = [elem for elem in smoothed_rewards]
-        plt.plot(reward_tracker)
-        plt.plot(smoothed_rewards)
-        plt.plot()
-        plt.xlabel('Episode')
-        plt.ylabel('Reward')
-        plt.show()
+        logger.info("Training interrupted by user")
+    
+    finally:
+        # Cleanup and plotting
+        env.close()
+        
+        if reward_history:
+            # Plot training curves
+            smoothed_rewards = pd.Series(reward_history).rolling(10).mean()
+            plt.figure(figsize=(10, 5))
+            plt.plot(reward_history, alpha=0.6, label='Raw')
+            plt.plot(smoothed_rewards, label='Smoothed')
+            plt.xlabel('Episode')
+            plt.ylabel('Reward')
+            plt.legend()
+            plt.savefig('training_rewards.png')
+            plt.close()
 
-        plt.plot(time_tracker)
-        plt.xlabel('Episode')
-        plt.ylabel('Episode length')
-        plt.show()
+if __name__ == "__main__":
+    main()
