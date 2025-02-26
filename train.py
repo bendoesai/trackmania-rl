@@ -13,6 +13,7 @@ from typing import Dict, Type, Set
 
 def get_agent_required_args() -> Dict[str, Set[str]]:
     """Define required arguments for each agent type"""
+    #TODO: implement at agent level
     return {
         'dummy': set(),  # Dummy agent needs no config
         'vpg': {'hidden', 'batch_size', 'lr', 'gamma'},
@@ -32,7 +33,11 @@ def parse_args():
                         help='Agent type to use')
     parser.add_argument('--actor_model', type=str, default='basicnet', 
                         choices=['basicnet'],
-                        help='Agent type to use')
+                        help='actor model type to use')
+    parser.add_argument('--critic_model', type=str, default='basicnet', 
+                        choices=['basicnet'],
+                        help='critic model type to use')
+    parser.add_argument('--optimizer', type=str, default='adam')
     parser.add_argument('--checkpoint_path', type=str, default=None,
                         help='Path to load/save checkpoints')
     parser.add_argument('--eval_freq', type=int, default=10,
@@ -44,6 +49,13 @@ def parse_args():
     parser.add_argument('--max_timesteps', type=int, default=100000,
                         help='Maximum timesteps per episode')
     
+
+    parser.add_argument('--test_only', action='store_true',
+                        help='Only test the agent (no training)')
+    parser.add_argument('--test_episodes', type=int, default=5,
+                        help='Number of episodes to test when in test mode')
+
+
     # Common agent arguments
     parser.add_argument('--hidden', type=int, default=64,
                         help='Hidden layer size')
@@ -78,6 +90,10 @@ def parse_args():
 
 def validate_agent_config(agent_type: str, config: dict) -> None:
     """Validate config based on agent type"""
+
+    if config['test_only'] and config['checkpoint_path']:
+        return
+
     required_args = get_agent_required_args()[agent_type]
     missing = [arg for arg in required_args if arg not in config or config[arg] is None]
     if missing:
@@ -183,6 +199,13 @@ def main():
         logger.info(f"Loaded checkpoint from episode {start_episode}")
     else:
         start_episode = 0
+
+    if config['test_only']:
+        logger.info("Running in test-only mode")
+        mean_reward, std_reward = evaluate(agent, env, config['test_episodes'])
+        logger.info(f"Evaluation: Mean reward: {mean_reward:.3f} +/- {std_reward:.3f}")
+        env.close()
+        return 0
     
     # Training loop
     reward_history = []
@@ -199,11 +222,10 @@ def main():
             
             # Episode loop
             for step in range(config['max_timesteps']):
-
                 action = agent.act(obs)
 
                 next_obs, reward, terminated, truncated, info = env.step(np.array(action))
-                
+
                 # Store transition
                 agent.rewards.append(reward)
                 episode_rewards.append(reward)
@@ -211,9 +233,8 @@ def main():
                 obs = flatten_and_norm_observation(next_obs)
                 if terminated or truncated:
                     break
-            
+            #print(np.mean(episode_rewards))
             total_reward = sum(episode_rewards)
-            print(total_reward)
             reward_history.append(total_reward)
             
             # Batch update
@@ -226,9 +247,9 @@ def main():
             
             # Evaluation
             if episode > 0 and episode % config['eval_freq'] == 0:
-                mean_reward, std_reward = evaluate(agent, env)
+                mean_reward, std_reward = evaluate(agent, env, config['test_episodes'])
                 logger.info(f"Evaluation: Mean reward: {mean_reward:.3f} +/- {std_reward:.3f}")
-                
+
                 # Save best model
                 if mean_reward > best_eval_reward and config['checkpoint_path']:
                     best_eval_reward = mean_reward

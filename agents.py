@@ -13,10 +13,13 @@ import networks
 
 
 
-DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+#DEVICE = 'cpu'
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger()
+
+
 
 def build_model(model, obs_space, hidden, act_space) -> nn.Module:
     model_map = {
@@ -26,8 +29,17 @@ def build_model(model, obs_space, hidden, act_space) -> nn.Module:
     if model.lower() not in model_map:
         raise ValueError(f'Model {model} not recognized. Choose from {list(model_map.keys())}')
     
-    return model_map[model.lower()](obs_space, hidden, act_space)
+    return model_map[model.lower()](obs_space, hidden, act_space).to(DEVICE)
 
+def build_opt(opt, params, lr) -> nn.Module:
+    opt_map = {
+        'adam': torch.optim.Adam,
+    }
+
+    if opt.lower() not in opt_map:
+        raise ValueError(f'Optimizer {opt} not recognized. Choose from {list(opt_map.keys())}')
+    
+    return opt_map[opt.lower()](params, lr=lr)
 
 class DummyAgent(nn.Module):
     def __init__(self, config, obs_space, act_space):
@@ -48,19 +60,20 @@ class VPGAgent(nn.Module):
         self.name = 'vpg'
         self.act_space = act_space
         self.gamma = config['gamma']
-        
+
         # Storage
         self.saved_log_probs = []
         self.rewards = []
         self.actions = []
         
+        self.to(DEVICE)
+
         # Hook for external policy network
         self.policy = build_model(config['actor_model'], obs_space, config['hidden'], act_space * 2)
-    
-    def forward(self, obs):
-        if isinstance(obs, np.ndarray):
-            obs = torch.FloatTensor(obs)
-            
+        print(config)
+        self.optimizer = build_opt(config['optimizer'], self.policy.parameters(), config['lr'])
+
+    def forward(self, obs): 
         action_params = self.policy(obs)
         
         # Split into means and log stds
@@ -69,14 +82,17 @@ class VPGAgent(nn.Module):
         log_stds = action_params[..., action_dim:]
         
         # Clamp log_stds for stability
+        log_stds = 2*torch.tanh(log_stds/2.0)
         stds = log_stds.exp()
         
         return means, stds
     
     def act(self, obs, eval = False):
+        if isinstance(obs, np.ndarray):
+            obs = torch.from_numpy(obs).to(DEVICE)
+        
         means, stds = self.forward(obs)
-        if not eval:
-            stds = torch.clamp(stds, min=0.1, max=8)
+
         dist = Normal(means, stds)
         raw_action = dist.rsample()  # Use reparameterization trick
         action = torch.tanh(raw_action)  # Squash action to (-1,1)
@@ -88,24 +104,25 @@ class VPGAgent(nn.Module):
             self.saved_log_probs.append(log_prob)
             self.actions.append(action)
 
-        return action.detach().numpy()
+        return action.cpu().detach().numpy()
     
     def update(self):
         returns = self._compute_returns()
+
         policy_loss = -torch.stack(self.saved_log_probs) * returns
         policy_loss = policy_loss.mean()
+
+        print(f"Policy Loss: {policy_loss.item()}")
 
         self.optimizer.zero_grad()
         policy_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-        for param in self.policy.parameters():
-            logger.debug(param.grad.norm().item() if param.grad is not None else "No grad")
         self.optimizer.step()
-        
+
         self.saved_log_probs = []
         self.rewards = []
         self.actions = []
-        
+
         return policy_loss.item()
     
     def _compute_returns(self):
@@ -114,28 +131,23 @@ class VPGAgent(nn.Module):
         for r in reversed(self.rewards):
             R = r + self.gamma * R
             returns.insert(0, R)
-        returns = torch.FloatTensor(returns)
+        returns = torch.FloatTensor(returns).to(DEVICE)
+        # print(returns)
         returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+        # print(returns)
         return returns
 
 
 
 class TRPOAgent(nn.Module):
+    '''
+    Trust Region Policy Optimization
+    - on-policy
+    - stochastic
+    '''
     def __init__(self, config, obs_space, act_space):
         super().__init__()
-        self.name = 'trpo'
-        self.act_space = act_space[0]
-        self.gamma = config['gamma']
-        self.max_kl = config['max_kl']
-        
-        # Storage
-        self.saved_log_probs = []
-        self.rewards = []
-        self.actions = []
-        
-        # Hook for external policy network
-        self.policy = None
-        self.value = None
+        raise NotImplementedError("TPRO not yet implemented")
     
     def forward(self, obs):
         if self.policy is None:
