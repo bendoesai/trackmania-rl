@@ -1,5 +1,9 @@
 https://github.com/trackmania-rl/tmrl
 
+TODO:
+- finish algorithms in agents.py
+- grid search for hyperparameters
+- integrate tmrl with random track generator (https://openplanet.dev/plugin/trackgenerator) for more robust training
 
 Notes
 -   TMRLData/Configs/config.json

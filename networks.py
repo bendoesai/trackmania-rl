@@ -10,9 +10,13 @@ class basicnet(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(hidden, hidden),
             nn.LeakyReLU(),
-            nn.Linear(hidden, act_space)
+            nn.Linear(hidden, act_space),
         )
 
     def forward(self, obs):
         action_params = self.network(obs)
         return action_params
+    
+
+class LSTMNet(nn.Module):
+    pass
