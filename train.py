@@ -1,5 +1,6 @@
 from tmrl import get_environment
 import gymnasium as gym
+from gymnasium.envs.registration import register
 
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -20,18 +21,7 @@ from typing import Dict, Type, Set
 
 from utils import flatten_and_norm
 
-def get_agent_required_args() -> Dict[str, Set[str]]:
-    """Define required arguments for each agent type"""
-    #TODO: implement at agent level
-    return {
-        'dummy': set(),  # Dummy agent needs no config
-        'vpg': {'hidden', 'batch_size', 'lr', 'gamma'},
-        'trpo': {'hidden', 'batch_size', 'lr', 'gamma', 'max_kl'},
-        'ppo': {'hidden', 'batch_size', 'actor_lr', 'critic_lr', 'gamma', 'clip_ratio', 'vf_coef'},
-        'ddpg': {'hidden', 'batch_size', 'actor_lr', 'critic_lr', 'gamma', 'tau', 'buffer_size'},
-        'td3': {'hidden', 'batch_size', 'lr', 'gamma', 'tau', 'buffer_size', 'policy_delay'},
-        'sac': {'hidden', 'batch_size', 'actor_lr', 'critic_lr', 'gamma', 'alpha', 'buffer_size'}
-    }
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train RL agents on LIDAR environment')
@@ -61,8 +51,8 @@ def parse_args():
                         help='Maximum timesteps per episode')
     
 
-    parser.add_argument('--easy_env', action='store_true',
-                        help='test algorithm with Mountain Car Continuous')
+    parser.add_argument('--env_name', type=str,
+                        help='name of environment to run')
     parser.add_argument('--test_only', action='store_true',
                         help='Only test the agent (no training)')
     parser.add_argument('--test_episodes', type=int, default=5,
@@ -72,6 +62,8 @@ def parse_args():
     # Common agent arguments
     parser.add_argument('--hidden', type=int, default=64,
                         help='Hidden layer size')
+    parser.add_argument('--hidden_depth', type=int, default=1,
+                        help='number of hidden layers')
     parser.add_argument('--batch_size', type=int, default=10,
                         help='Batch size for updates')
     parser.add_argument('--actor_lr', type=float, default=5e-4,
@@ -87,7 +79,19 @@ def parse_args():
     parser.add_argument('--max_grad_norm', type=float, default=1,
                         help='max gradient value')
     
+    parser.add_argument('--anneal_lr', action='store_true', default=False,
+                        help='anneal learning rate over time')
+    parser.add_argument('--min_lr', type=float, default=1e-6,
+                        help='minimum learning rate')
+
     # Agent-specific arguments
+    parser.add_argument('--noise', type=str, default='gaussian', 
+                        choices=['gaussian', 'ou', 'ou'],
+                        help='noise method to use')
+    parser.add_argument('--noise_std', type=float, default=0.5,
+                        help='noise standard deviation')
+    parser.add_argument('--noise_decay', type=float, default=0.99,
+                        help='noise decay rate')
     parser.add_argument('--max_kl', type=float, default=0.01,
                         help='TRPO max KL divergence')
     parser.add_argument('--clip_ratio', type=float, default=0.2,
@@ -117,31 +121,7 @@ def parse_args():
     config = vars(args)
     return config
 
-def validate_agent_config(agent_type: str, config: dict) -> None:
-    """Validate config based on agent type"""
-    #TODO: implement at agent level (_check_params)
-    if config['test_only'] and config['checkpoint_path']:
-        return
 
-    required_args = get_agent_required_args()[agent_type]
-    missing = [arg for arg in required_args if arg not in config or config[arg] is None]
-    if missing:
-        raise ValueError(f"Agent {agent_type} requires the following arguments: {missing}")
-    
-    # Agent-specific validation
-    if agent_type == 'vpg':
-        if config['batch_size'] < 1:
-            raise ValueError("batch_size must be positive")
-        if config['lr'] <= 0:
-            raise ValueError("lr must be positive")
-        if not 0 <= config['gamma'] <= 1:
-            raise ValueError("gamma must be between 0 and 1")
-    
-    elif agent_type == 'ppo':
-        if config['clip_ratio'] <= 0:
-            raise ValueError("clip_ratio must be positive")
-        if config['vf_coef'] < 0:
-            raise ValueError("vf_coef must be non-negative")
 
 def build_agent(agent_name: str, config: dict, obs_space_flat: int, num_actions: tuple):
     agent_map = {
@@ -159,7 +139,41 @@ def build_agent(agent_name: str, config: dict, obs_space_flat: int, num_actions:
     
     return agent_map[agent_name.lower()](config, obs_space_flat, num_actions)
 
-def evaluate(agent, env, num_episodes=5):
+
+
+def build_env(env_id):
+    # Handle TMRL environment
+    if env_id == 'tmrl':
+        env = get_environment()
+    
+    # Handle custom debug environments
+    elif env_id in ['SimpleEnv', 'RandomObsRewardEnv', 'TwoStepDelayedRewardEnv', 
+                   'ActionDependentRewardEnv', 'ActionObsDependentRewardEnv']:
+        id = env_id+'-v0'
+        register(
+            id=id,
+            entry_point="debug_envs.debug_envs:" + env_id
+        )
+        env = gym.make(id)
+    
+    # Handle standard gymnasium environments
+    else:
+        try:
+            # Try to create the environment directly if it's a standard gym env
+            env = gym.make(env_id)
+        except gym.error.UnregisteredEnv:
+            # If not found, assume it's a custom env that needs registration
+            register(
+                id=env_id,
+                entry_point="debug_envs.debug_envs:" + env_id
+            )
+            env = gym.make(env_id)
+    
+    return env
+
+
+
+def evaluate(agent, env, num_episodes=5, max_timesteps=400):
     agent.eval()
     eval_rewards = []
     
@@ -169,18 +183,22 @@ def evaluate(agent, env, num_episodes=5):
         episode_reward = 0
         done = False
         
-        while not done:
+        for step in range(max_timesteps):
             with torch.no_grad():
                 action = agent.act(obs, eval=True)
             obs, reward, terminated, truncated, _ = env.step(np.array(action))
             obs = flatten_and_norm(obs)
             episode_reward += reward
             done = terminated or truncated
+            if done:
+                break
             
         eval_rewards.append(episode_reward)
-    
+        env.unwrapped.wait()
     agent.train()
     return np.mean(eval_rewards), np.std(eval_rewards)
+
+
 
 def main():
     # Setup logging
@@ -189,24 +207,28 @@ def main():
     
     # Parse and validate config
     config = parse_args()
-    validate_agent_config(config['agent'], config)
     
     # Setup environment
-    if config['easy_env']:
-        if config['test_only']:
-            env = gym.make("MountainCarContinuous-v0", render_mode='human')
-        else:
-            env = gym.make("MountainCarContinuous-v0")
-    else:
-        env = get_environment()
+    env = build_env(config['env_name'])
     
     print(env.observation_space)
-    if config['easy_env']:
-        obs_space_flat = env.observation_space.shape[0]
+    if config['env_name'] != 'tmrl':
+        # Handle empty observation spaces
+        if env.observation_space.shape == (0,) or len(env.observation_space.shape) == 0:
+            obs_space_flat = 0
+        else:
+            obs_space_flat = env.observation_space.shape[0]
     else:
         obs_space_flat = sum(np.prod(box.shape) for box in env.observation_space)
     
-    num_actions = env.action_space.shape[0]
+    # Handle empty action spaces
+    if isinstance(env.action_space, gym.spaces.Discrete):
+        raise Exception("Discrete action spaces are not supported yet")
+    else:
+        if len(env.action_space.shape) == 0 or env.action_space.shape == (0,):
+            num_actions = 0
+        else:
+            num_actions = env.action_space.shape[0]
 
     logger.info(f"Observation space: {obs_space_flat}")
     logger.info(f"Action space: {num_actions}")
@@ -221,9 +243,8 @@ def main():
     # Initialize agent and optimizer
     agent = build_agent(config['agent'], config, obs_space_flat, num_actions)
     
-    file_name = os.path.join(config['checkpoint_path'], agent.name)
-    if config['easy_env']:
-        file_name = str(file_name) + "_easy"
+    file_name = os.path.join(config['checkpoint_path'], agent.name, config['env_name'])
+    os.makedirs(os.path.join(config['checkpoint_path'], agent.name), exist_ok=True)
 
     checkpoint = None
 
@@ -248,7 +269,7 @@ def main():
 
     if config['test_only']:
         logger.info("Running in test-only mode")
-        mean_reward, std_reward = evaluate(agent, env, config['test_episodes'])
+        mean_reward, std_reward = evaluate(agent, env, config['test_episodes'], config['max_timesteps'])
         logger.info(f"Evaluation: Mean reward: {mean_reward:.3f} +/- {std_reward:.3f}")
         env.close()
         return 0
@@ -279,8 +300,8 @@ def main():
                 
                 obs = flatten_and_norm(next_obs)
                 if terminated or truncated:
-                    timesteps += step
                     break
+                timesteps += 1
             
             #print(np.mean(episode_rewards))
             total_reward = sum(episode_rewards)
@@ -296,7 +317,7 @@ def main():
 
             # Evaluation
             if episode > start_episode and episode % config['eval_freq'] == 0:
-                mean_reward, std_reward = evaluate(agent, env, config['test_episodes'])
+                mean_reward, std_reward = evaluate(agent, env, config['test_episodes'], config['max_timesteps'])
                 logger.info(f"Evaluation: Mean reward: {mean_reward:.3f} +/- {std_reward:.3f}")
 
                 # Save best model
@@ -328,7 +349,7 @@ def main():
                     torch.save(checkpoint, file_path)
                     logger.info(f"Saved new best model with reward {mean_reward:.3f}")
             
-            if not config['easy_env']:
+            if config['env_name'] == 'tmrl':
                 env.unwrapped.wait()
             
     except KeyboardInterrupt:

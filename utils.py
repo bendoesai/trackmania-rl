@@ -6,8 +6,17 @@ from collections import deque, namedtuple
 from copy import copy
 
 def flatten_and_norm(obs):
-    """Flattens a tuple of tuples with varying lengths into a single tuple."""
-    flat = np.concatenate([np.ravel(arr) for arr in obs])
+    """Flattens observation data, handling both tuple observations and single arrays."""
+    if isinstance(obs, (list, tuple)):
+        # Handle tuple observations (like from TMRL environment)
+        if len(obs) > 0:
+            flat = np.concatenate([np.ravel(arr) for arr in obs])
+        else:
+            flat = np.array([], dtype=np.float32)
+    else:
+        # Handle single array observations (like from SimpleEnv)
+        flat = np.ravel(obs)
+    
     return flat
 
 Experience = namedtuple('Experience', ['state', 'action', 'reward', 'next_state', 'done'])
@@ -37,42 +46,50 @@ class PriorityBuffer:
     pass
 
 class GaussianNoise:
-    '''standard gaussian noise'''
-
-    def __init__(self, act_space, up_lim, down_lim):
-        
-        self.mu = (up_lim + down_lim) / 2
-        self.std = (up_lim - down_lim) / 4
-        
-        self.mu = self.mu * torch.ones(act_space)
-        self.std = self.std * torch.ones(act_space)
-
+    '''standard gaussian noise with decay'''
+    def __init__(self, act_space, sigma=0.5, decay=0.999, min_std=0.01):
+        self.mu = 0 * torch.ones(act_space)
+        self.std = sigma * torch.ones(act_space)
+        self.decay = decay
+        self.min_std = min_std * torch.ones(act_space)
         self.dist = Normal(self.mu, self.std)
-
+        self.steps = 0
+        
     def reset(self):
+        # Reset noise parameters
         pass
-
-    def sample(self, current_reward):
+        
+    def sample(self, current_reward=None):
         return self.dist.rsample()
     
-    def update_max_reward(self, current_reward):
+    def update_max_reward(self, current_reward=None):
         pass
+    
+    def step_decay(self):
+        '''Decay the standard deviation after each step'''
+        self.steps += 1
+        # Apply decay to standard deviation
+        self.std = torch.max(self.min_std, self.std * self.decay)
+        # Update distribution with new std
+        self.dist = Normal(self.mu, self.std)
+        print(f"New noise std: {self.std}")
 
 
 class OUNoise:
     '''Ornstein-Uhlenbeck process.'''
 
-    def __init__(self, size=1, mu=0, theta=1.0, sigma=0.5, dt=0.1):
+    def __init__(self, size=1, mu=0, theta=1.0, sigma=0.5, dt=0.1, decay=0.99):
         """Initialize parameters and noise process."""
         self.mu = mu * np.ones(size)
         self.theta = theta
         self.sigma = sigma
         self.dt = dt
+        self.decay = decay
         self.reset()
 
     def reset(self):
         """Reset the internal state (= noise) to mean (mu)."""
-        self.state = copy(self.mu)
+        self.state = self.decay * copy(self.mu)
 
     def sample(self, current_reward):
         """Update internal state and return it as a noise sample."""

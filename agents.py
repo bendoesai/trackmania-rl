@@ -50,6 +50,7 @@ class VPGAgent(nn.Module):
         self.name = 'vpg'
         self.act_space = act_space
         self.gamma = config['gamma']
+        self.max_grad_norm = config['max_grad_norm']
 
         # Storage
         self.saved_log_probs = []
@@ -60,7 +61,7 @@ class VPGAgent(nn.Module):
 
         # Hook for external policy network
         self.policy = build_model(config['actor_model'], obs_space, config['hidden'], act_space * 2)
-        self.optimizer = torch.optim.Adam(self.policy.parameters(), config['lr'])
+        self.optimizer = torch.optim.Adam(self.policy.parameters(), config['actor_lr'])
 
     def forward(self, obs): 
         action_params = self.policy(obs)
@@ -71,7 +72,7 @@ class VPGAgent(nn.Module):
         log_stds = action_params[..., action_dim:]
         
         # "Clamp" log_stds for stability
-        log_stds = 2*torch.tanh(log_stds/2.0)
+        log_stds = torch.tanh(log_stds)
         stds = log_stds.exp()
         
         return means, stds
@@ -95,6 +96,10 @@ class VPGAgent(nn.Module):
 
         return action.cpu().detach().numpy()
     
+    def store_transition(self, state, action, reward, next_state, done):
+        #BUG: MUST COMPUTE DISCOUNTED REWARDS PER EPISODE NOT PER UPDATE
+        self.rewards.append(reward)
+    
     def update(self):
         returns = self._compute_returns()
 
@@ -105,7 +110,7 @@ class VPGAgent(nn.Module):
 
         self.optimizer.zero_grad()
         policy_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.max_grad_norm)
         self.optimizer.step()
 
         self.saved_log_probs = []
@@ -190,15 +195,25 @@ class PPOAgent(nn.Module):
         self.policy = build_model(config['actor_model'], obs_space, config['hidden'], act_space * 2)
         self.value = build_model(config['critic_model'], obs_space, config['hidden'], 1)
 
-        #TODO: Implement separate policy and value optimizers
-        self.optimizer = torch.optim.Adam([
-            {'params': self.policy.parameters(), 'lr': config['actor_lr'], 'eps': 1e-5},
-            {'params': self.value.parameters(), 'lr': config['critic_lr'], 'eps': 1e-5},
-        ])
+        self.actor_optimizer = torch.optim.Adam(self.policy.parameters(), lr=config['actor_lr'])
+        self.critic_optimizer = torch.optim.Adam(self.value.parameters(), lr=config['critic_lr'])
+
+        if config['anneal_lr']:
+            self.actor_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.actor_optimizer,
+                T_max=config['max_episodes'] // config['batch_size'],
+                eta_min=config['min_lr']
+            )
+            self.critic_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.critic_optimizer,
+                T_max=config['max_episodes'] // config['batch_size'],
+                eta_min=config['min_lr']
+            )
 
         self.to(DEVICE)
     
     def forward(self, obs):
+        obs = (obs-obs.mean())/(obs.std()+1e-8)
         action_params = self.policy(obs)
 
         action_dim = action_params.shape[-1] // 2
@@ -224,14 +239,13 @@ class PPOAgent(nn.Module):
             value = self.value(obs)
 
             #tanh correction
-            #log_prob -= torch.sum(torch.log(torch.clamp(1 - action.pow(2), min=1e-2)), dim=-1)
+            log_prob -= torch.sum(torch.log(torch.clamp(1 - action.pow(2), min=1e-2)), dim=-1)
 
         if not eval:    
             self.states.append(obs)
             self.actions.append(action)
             self.log_probs.append(log_prob)
             self.values.append(value)
-        print(action, log_prob)
         
         return action.detach().cpu().numpy()
     
@@ -276,48 +290,75 @@ class PPOAgent(nn.Module):
         states = torch.stack(self.states)
         actions = torch.stack(self.actions)
         old_log_probs = torch.stack(self.log_probs)
-        
+
+        batch_size = min(64, len(states) // 4)  # Adjust as needed
+
+        policy_losses = []
+        value_losses = []
+    
         for _ in range(self.ppo_epochs):
-            # Get current action distribution
-            means, stds = self.forward(states)
-            dist = Normal(means, stds)
+            # Generate random indices for shuffling
+            indices = torch.randperm(len(states))
             
-            # Get current log probabilities and entropy
-            new_log_probs = dist.log_prob(actions).sum(dim=1)
-            entropy = torch.clamp(dist.entropy().mean(), min=0.05)
+            # Process mini-batches
+            for start_idx in range(0, len(states), batch_size):
+                # Get mini-batch indices
+                mb_indices = indices[start_idx:start_idx + batch_size]
+                
+                # Extract mini-batch data
+                mb_states = states[mb_indices]
+                mb_actions = actions[mb_indices]
+                mb_old_log_probs = old_log_probs[mb_indices]
+                mb_advantages = advantages[mb_indices]
+                mb_returns = returns[mb_indices]
+                
+                # Run forward pass on mini-batch
+                means, stds = self.forward(mb_states)
+                dist = Normal(means, stds)
+                
+                # Get current log probabilities and entropy
+                new_log_probs = dist.log_prob(mb_actions).sum(dim=1)
+                entropy = torch.clamp(dist.entropy().mean(), min=0.05)
+                
+                # Ratio between new and old policies
+                # Using exp(new - old) for numerical stability instead of new/old
+                ratio = torch.exp(new_log_probs - mb_old_log_probs)
+                
+                # PPO-CLIP objectives
+                obj1 = ratio * mb_advantages
+                obj2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * mb_advantages
+                policy_loss = -torch.min(obj1, obj2).mean()
+                
+                # Add entropy bonus to encourage exploration
+                policy_loss = policy_loss - self.entropy_coef * entropy
+                policy_losses.append(policy_loss)
+                
+                # Value function loss
+                value_preds = self.value(mb_states).squeeze()
+                value_loss = self.vf_coef * F.mse_loss(value_preds, mb_returns)
+                value_losses.append(value_loss)
+                
+                # Perform gradient step
+                self.actor_optimizer.zero_grad()
+                policy_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=self.max_norm)
+                self.actor_optimizer.step()
+
+                self.critic_optimizer.zero_grad()
+                value_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.value.parameters(), max_norm=self.max_norm)
+                self.critic_optimizer.step()
+                
+                
+                # grad_norms = list([param.grad.norm() for param in self.policy.parameters()])
+                # logger.info(f"Policy grad norm: [{min(grad_norms)}, {max(grad_norms)}]")
+                # grad_norms = list([param.grad.norm() for param in self.value.parameters()])
+                # logger.info(f"Value grad norm: [{min(grad_norms)}, {max(grad_norms)}]")
+
+        self.actor_scheduler.step()
+        self.critic_scheduler.step()
             
-            # Ratio between new and old policies
-            # Using exp(new - old) for numerical stability instead of new/old
-            ratio = torch.exp(new_log_probs - old_log_probs)
-            
-            # PPO-CLIP objectives
-            obj1 = ratio * advantages
-            obj2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
-            policy_loss = -torch.min(obj1, obj2).mean()
-            
-            # Add entropy bonus to encourage exploration
-            policy_loss = policy_loss - self.entropy_coef * entropy
-            
-            # Value function loss
-            value_preds = self.value(states).squeeze()
-            value_loss = nn.MSELoss()(value_preds, returns)
-            
-            # Total loss
-            total_loss = policy_loss + self.vf_coef * value_loss
-            # Perform gradient step
-            self.optimizer.zero_grad()
-            total_loss.backward()
-            
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=self.max_norm)
-            torch.nn.utils.clip_grad_norm_(self.value.parameters(), max_norm=self.max_norm)
-            grad_norms = list([param.grad.norm() for param in self.policy.parameters()])
-            logger.info(f"Policy grad norm: [{min(grad_norms)}, {max(grad_norms)}]")
-            grad_norms = list([param.grad.norm() for param in self.value.parameters()])
-            logger.info(f"Value grad norm: [{min(grad_norms)}, {max(grad_norms)}]")
-            
-            self.optimizer.step()
-            
-        return policy_loss, value_loss
+        return sum(policy_losses)/len(policy_losses), sum(value_losses)/len(value_losses)
 
     def update(self):
         returns, advantages = self._process_rewards()
@@ -357,8 +398,8 @@ class DDPGAgent(nn.Module):
         self.down_bound = config['action_bound_down']
         self.max_grad_norm = config['max_grad_norm']
 
-        #self.noise = GaussianNoise(self.act_space, self.up_bound, self.down_bound)
-        self.noise = OUNoise(self.act_space, sigma=0.5)
+        self.noise = GaussianNoise(self.act_space, sigma=config['noise_std'], decay = config['noise_decay'])
+        #self.noise = OUNoise(self.act_space, sigma=config['noise_std'], decay = 0.999)
         self.current_episode_rewards = 0
         
         self.replay_buffer = ReplayBuffer(config['buffer_size'], device=DEVICE)
@@ -378,6 +419,18 @@ class DDPGAgent(nn.Module):
         # Setup optimizers - these will be set in main.py
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=config['actor_lr'], weight_decay=1e-4)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=config['critic_lr'], weight_decay=1e-4)
+
+        if config['anneal_lr']:
+            self.actor_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.actor_optimizer,
+                T_max=config['max_episodes'] // config['batch_size'],
+                eta_min=config['min_lr']
+            )
+            self.critic_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.critic_optimizer,
+                T_max=config['max_episodes'] // config['batch_size'],
+                eta_min=config['min_lr']
+            )
 
         self.to(DEVICE)
 
@@ -447,6 +500,10 @@ class DDPGAgent(nn.Module):
         # Update target networks
         self._soft_update(self.target_actor, self.actor)
         self._soft_update(self.target_critic, self.critic)
+
+        self.noise.step_decay()
+        self.actor_scheduler.step()
+        self.critic_scheduler.step()
         
         return critic_loss.item() + actor_loss.item()
     
@@ -524,6 +581,18 @@ class SACAgent(nn.Module):
             lr=config['critic_lr'],
             betas = [0.997, 0.997]
         )
+
+        if config['anneal_lr']:
+            self.actor_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.actor_optimizer,
+                T_max=config['max_episodes'] // config['batch_size'],
+                eta_min=config['min_lr']
+            )
+            self.critic_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.critic_optimizer,
+                T_max=config['max_episodes'] // config['batch_size'],
+                eta_min=config['min_lr']
+            )
         
         # Automatic entropy tuning
         self.target_entropy = -torch.prod(torch.Tensor([self.act_dim])).item()
@@ -559,7 +628,6 @@ class SACAgent(nn.Module):
             dist = Normal(means, stds)
             action = dist.rsample()
             action = torch.clamp(action, min=self.down_bound, max=self.up_bound)
-            log_prob = dist.log_prob(action).sum(-1)
 
         return action.detach().cpu().numpy()
     
@@ -568,11 +636,12 @@ class SACAgent(nn.Module):
         if isinstance(obs, np.ndarray):
             obs = torch.FloatTensor(obs).to(DEVICE)
         
-        means, stds = self.forward(obs)
-        dist = Normal(means, stds)
-        action = dist.rsample()
-        action = torch.clamp(action, min=self.down_bound, max=self.up_bound)
-        log_prob = dist.log_prob(action).sum(-1, keepdim=True)
+        with torch.no_grad():
+            means, stds = self.forward(obs)
+            dist = Normal(means, stds)
+            action = dist.rsample()
+            action = torch.clamp(action, min=self.down_bound, max=self.up_bound)
+            log_prob = dist.log_prob(action).sum(-1, keepdim=True)
         
         return action, log_prob
     
@@ -600,6 +669,9 @@ class SACAgent(nn.Module):
         # Current Q-values
         q1 = self.critic1(torch.cat((states, actions), dim=-1))
         q2 = self.critic2(torch.cat((states, actions), dim=-1))
+        
+        logger.info(f"Current Q1: {q1.item()}")
+        logger.info(f"Current Q2: {q2.item()}")
         
         # Compute critic losses
         critic1_loss = F.mse_loss(q1, q_target)
@@ -636,6 +708,9 @@ class SACAgent(nn.Module):
         
         self.alpha = self.log_alpha.exp()
         
+        self.actor_scheduler.step()
+        self.critic_scheduler.step()
+
         # Soft update target networks
         self._soft_update(self.target_critic1, self.critic1)
         self._soft_update(self.target_critic2, self.critic2)
